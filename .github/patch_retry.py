@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import re
 import sys
 
 CANDIDATES = [
@@ -33,22 +32,18 @@ if "g_lgSymbolsResolved" in src:
     sys.exit(0)
 
 
-# ============================================================
-# 辅助：带断言的替换，避免静默失败
-# ============================================================
 def replace_or_die(text, old, new, label, count=1):
     if old not in text:
-        print(f"ERROR: [{label}] pattern not found:")
-        print("-------- expected --------")
+        print(f"ERROR: [{label}] pattern NOT found. Expected literally:")
+        print("-------- BEGIN --------")
         print(old)
-        print("--------------------------")
+        print("--------- END ---------")
         sys.exit(1)
     return text.replace(old, new, count)
 
 
 # ============================================================
-# 1. 在函数入口插入缓存声明
-# FIX: 追加 g_lgCachedCtxSlot，用于 2018 行的 registrationDescriptor
+# 1. 函数入口插入缓存声明（不再包含 g_lgCachedDescriptor）
 # ============================================================
 anchor_fn = "static bool registerCustomFilter(void) {\n"
 if anchor_fn not in src:
@@ -61,14 +56,14 @@ cache_decl = (
     "    static void  **g_lgCachedVtable     = nullptr;\n"
     "    static int     g_lgCachedEdgeSlot   = -1;\n"
     "    static int     g_lgCachedRenderSlot = -1;\n"
-    "    static void   *g_lgCachedDescriptor = nullptr;\n"
-    "    static void  **g_lgCachedCtxSlot    = nullptr;\n"   # FIX
+    "    static void  **g_lgCachedCtxSlot    = nullptr;\n"
 )
 src = src.replace(anchor_fn, cache_decl, 1)
 
 
 # ============================================================
-# 2. 把解析段包进 if (!g_lgSymbolsResolved)，并缓存结果
+# 2. 解析段包进 if，并缓存；块内保留同名局部变量，
+#    块外不再声明桥接变量
 # ============================================================
 old_parse = """    void **gaussCtxSlot = (void **)LGResolve_GaussianCtxSlot();
     if (!gaussCtxSlot) {
@@ -134,7 +129,6 @@ new_parse = """    if (!g_lgSymbolsResolved) {
             lglog("registerCustomFilter: could not resolve gaussian context, aborting (no fallback)");
             return false;
         }
-        g_lgCachedCtxSlot = gaussCtxSlot;   // FIX: 供块外使用
 
         g_gaussCtxValue = LGSymStripData((void *)*gaussCtxSlot);
         lglog("registerCustomFilter: g_gaussCtxValue = %p (raw from %p)", g_gaussCtxValue, *gaussCtxSlot);
@@ -187,27 +181,22 @@ new_parse = """    if (!g_lgSymbolsResolved) {
             lglog("registerCustomFilter: Gaussian hooks installed before filter registration");
         }
 
-        // ---- 缓存解析结果，重试时直接用 ----
+        // ---- 缓存解析结果 ----
         g_lgCachedVtable     = gaussVtable;
         g_lgCachedEdgeSlot   = edgeInfoSlot;
         g_lgCachedRenderSlot = renderSlot;
+        g_lgCachedCtxSlot    = gaussCtxSlot;
         g_lgSymbolsResolved  = true;
         lglog("registerCustomFilter: symbols cached (vtable=%p edge=%d render=%d)",
               gaussVtable, edgeInfoSlot, renderSlot);
     }
-
-    // FIX: 块外使用缓存值（替代原作用域内局部变量）
-    void **gaussVtable   = g_lgCachedVtable;
-    int    edgeInfoSlot  = g_lgCachedEdgeSlot;
-    int    renderSlot    = g_lgCachedRenderSlot;
-    void **gaussCtxSlot  = g_lgCachedCtxSlot;
 """
 
 src = replace_or_die(src, old_parse, new_parse, "parse block")
 
 
 # ============================================================
-# 3. 替换重试块：改 200 次 + 主队列
+# 3. 重试块：200 次 + 主队列
 # ============================================================
 old_retry = """    if (!*filterTableSlot) {
         lglog("registerCustomFilter: filter_table null, retrying in 250ms");
@@ -241,8 +230,10 @@ src = replace_or_die(src, old_retry, new_retry, "retry block")
 
 
 # ============================================================
-# 4. 后续引用改成缓存变量（全部走断言）
+# 4. 所有块外引用 → 缓存变量（全部走 replace_or_die）
+#    如果哪条没匹配上，脚本会打印期望原文并退出
 # ============================================================
+
 src = replace_or_die(
     src,
     "memcpy(g_customVtable, gaussVtable, kVtableSlots * sizeof(void *));",
@@ -250,7 +241,6 @@ src = replace_or_die(
     "memcpy customVtable",
 )
 
-# clone 路径里按槽位写入
 src = replace_or_die(
     src,
     "g_customVtable[edgeInfoSlot] =\n            LGSymStripCode((void *)&ourCustomEdgeInfo);",
@@ -265,7 +255,6 @@ src = replace_or_die(
     "customVtable renderSlot",
 )
 
-# 原始函数指针
 src = replace_or_die(
     src,
     "g_origGaussR13 = (Render13Fn)LGSymMakeCallable(gaussVtable[renderSlot]);",
@@ -280,7 +269,6 @@ src = replace_or_die(
     "origGaussEdgeInfo",
 )
 
-# done 日志里的 renderSlot
 src = replace_or_die(
     src,
     "renderSlot, atomId, kHostCount);",
@@ -288,7 +276,6 @@ src = replace_or_die(
     "done log renderSlot",
 )
 
-# FIX: 2018 行的 registrationDescriptor
 src = replace_or_die(
     src,
     "registrationDescriptor = gaussCtxSlot;",
@@ -298,18 +285,11 @@ src = replace_or_die(
 
 
 # ============================================================
-# 5. 安全检查：确认块外没有残留裸引用
+# 5. 写盘
 # ============================================================
-leaks = []
-for i, line in enumerate(src.splitlines(), 1):
-    if "if (!g_lgSymbolsResolved)" in line:
-        # 从这里到对应的闭合括号之后，跳过检查（粗略判断，仅做提示）
-        leaks.append(("IN-IF", i, line.strip()))
-        break
-
 with open(PATH, "w", encoding="utf-8") as f:
     f.write(src)
 
-print(f"patched: symbols cached + retry 200 on main queue in {PATH}")
-print("next: grep -n 'gaussVtable\\|gaussCtxSlot\\|edgeInfoSlot\\|renderSlot' Tweak.mm")
-print("      confirm no bare reference remains outside the if-block")
+print(f"patched OK: symbols cached + retry 200 on main queue in {PATH}")
+print("verify:  grep -n 'gaussVtable\\|gaussCtxSlot\\|edgeInfoSlot\\|renderSlot' " + PATH)
+print("         (outside the if-block there must be NO bare names)")
