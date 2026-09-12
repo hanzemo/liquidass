@@ -41,7 +41,7 @@ pattern = re.compile(
 
 replacement = '''if (!*filterTableSlot) {
         static int sRetry = 0;
-        static const int kMaxRetries = 5;
+        static const int kMaxRetries = 200;
         if (sRetry < kMaxRetries) {
             sRetry++;
             lglog("registerCustomFilter: retry %d/%d slot=%p *slot=%p",
