@@ -28,52 +28,47 @@ if "registerCustomFilter" not in src:
     print(f"SKIP: {PATH} has no registerCustomFilter")
     sys.exit(0)
 
-# 幂等检查改用更精确的标记，避免之前跑过 5 次版本时误判
-if "kMaxRetries = 200" in src:
-    print(f"SKIP: {PATH} already patched with 200 retries")
+if "LG_SCAN:" in src:
+    print(f"SKIP: {PATH} already patched")
     sys.exit(0)
 
+# 原块：只匹配 if (!*filterTableSlot) { ... return false; }
 pattern = re.compile(
-    r'if\s*\(\s*!\s*\*\s*filterTableSlot\s*\)\s*\{.*?'
-    r'registerCustomFilter\s*\(\s*\)\s*;.*?'
-    r'return\s+false\s*;\s*\}',
+    r'if\s*\(\s*!\s*\*\s*filterTableSlot\s*\)\s*\{.*?return\s+false\s*;\s*\}',
     re.DOTALL,
 )
 
 replacement = '''if (!*filterTableSlot) {
-        static int sRetry = 0;
-        static const int kMaxRetries = 200;
-        if (sRetry < kMaxRetries) {
-            sRetry++;
-            lglog("registerCustomFilter: retry %d/%d slot=%p *slot=%p",
-                  sRetry, kMaxRetries, filterTableSlot, *filterTableSlot);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
-                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
-                           ^{ registerCustomFilter(); });
-        } else {
-            lglog("registerCustomFilter: gave up after %d retries, *slot=%p",
-                  kMaxRetries, *filterTableSlot);
-        }
-        return false;
-    }
+        // LG_SCAN: 不动重试，只打印诊断信息
+        lglog("LG_SCAN: slot=%p *slot=%p",
+              filterTableSlot, *filterTableSlot);
 
-    static void *g_cachedFilterTable = nullptr;
-    if (!g_cachedFilterTable) {
-        g_cachedFilterTable = *filterTableSlot;
-        if (g_cachedFilterTable) {
-            lglog("registerCustomFilter: cached filter table=%p (slot=%p)",
-                  g_cachedFilterTable, filterTableSlot);
+        // 扫描 slot 前后 16 个 8 字节，看哪个位置有非零值
+        void **base = filterTableSlot;
+        for (int i = -8; i <= 8; i++) {
+            void **candidate = base + i;
+            void *value = *candidate;
+            if (value != NULL) {
+                lglog("LG_SCAN: [%+d] %p -> %p  <== 非零",
+                      i, candidate, value);
+            }
         }
+        lglog("LG_SCAN: scan done");
+
+        // 保持原重试逻辑不变
+        lglog("registerCustomFilter: filter_table null, retrying in 250ms");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                       ^{ registerCustomFilter(); });
+        return false;
     }'''
 
 new_src, n = pattern.subn(replacement, src, count=1)
 if n == 0:
-    print(f"WARN: retry block not found in {PATH}, no changes applied")
+    print(f"WARN: retry block not found in {PATH}")
     sys.exit(0)
 
-src = new_src
-
 with open(PATH, "w", encoding="utf-8") as f:
-    f.write(src)
+    f.write(new_src)
 
-print(f"patched: retry raised to 200 in {PATH}")
+print(f"patched: LG_SCAN logging inserted in {PATH}")
