@@ -60,10 +60,6 @@ jobs:
       - name: patch registerCustomFilter
         run: python3 .github/patch_retry.py
 
-      - name: show patched block
-        run: |
-          grep -n -A 30 "filter_table null" LiquidAssBackboardd/Tweak.mm
-
       - name: build roothide
         run: |
           make clean
