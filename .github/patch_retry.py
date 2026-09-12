@@ -1,37 +1,45 @@
 #!/usr/bin/env python3
+import os
 import re
 import sys
 
-PATH = "LiquidAssBackboardd/Tweak.mm"
+CANDIDATES = [
+    "LiquidAssBackboardd/Tweak.mm",
+    "LiquidAssBackboardd/Tweak.x",
+    "Sources/Tweak.mm",
+    "Tweak.mm",
+    "Tweak.x",
+]
+
+PATH = None
+for p in CANDIDATES:
+    if os.path.exists(p):
+        PATH = p
+        break
+
+if PATH is None:
+    print("SKIP: no Tweak file found")
+    sys.exit(0)
 
 with open(PATH, "r", encoding="utf-8") as f:
     src = f.read()
 
-# ---------- 1. 函数入口插入缓存声明 ----------
-anchor_fn = "static bool registerCustomFilter(void) {\n"
-if anchor_fn not in src:
-    sys.exit("ERROR: registerCustomFilter anchor not found")
+if "registerCustomFilter" not in src:
+    print(f"SKIP: {PATH} has no registerCustomFilter")
+    sys.exit(0)
 
-if "g_cachedFilterTableSlot" in src:
-    sys.exit("ERROR: file already patched")
+if "g_cachedFilterTable" in src:
+    print(f"SKIP: {PATH} already patched")
+    sys.exit(0)
 
-cache_decl = (
-    "static bool registerCustomFilter(void) {\n"
-    "    static void **g_cachedFilterTableSlot = nullptr;\n"
-    "    static void  *g_cachedFilterTable = nullptr;\n"
+pattern = re.compile(
+    r'if\s*\(\s*!\s*\*\s*filterTableSlot\s*\)\s*\{.*?'
+    r'registerCustomFilter\s*\(\s*\)\s*;.*?'
+    r'return\s+false\s*;\s*\}',
+    re.DOTALL,
 )
-src = src.replace(anchor_fn, cache_decl, 1)
 
-# ---------- 2. 用精确字符串替换 ----------
-old_block = '''    if (!*filterTableSlot) {
-        lglog("registerCustomFilter: filter_table null, retrying in 250ms");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
-                       ^{ registerCustomFilter(); });
-        return false;
-    }'''
-
-new_block = '''    if (!*filterTableSlot) {
+replacement = '''if (!*filterTableSlot) {
         static int sRetry = 0;
         static const int kMaxRetries = 5;
         if (sRetry < kMaxRetries) {
@@ -48,6 +56,7 @@ new_block = '''    if (!*filterTableSlot) {
         return false;
     }
 
+    static void *g_cachedFilterTable = nullptr;
     if (!g_cachedFilterTable) {
         g_cachedFilterTable = *filterTableSlot;
         if (g_cachedFilterTable) {
@@ -56,12 +65,14 @@ new_block = '''    if (!*filterTableSlot) {
         }
     }'''
 
-if old_block not in src:
-    sys.exit("ERROR: retry block not found (exact match failed)")
+new_src, n = pattern.subn(replacement, src, count=1)
+if n == 0:
+    print(f"WARN: retry block not found in {PATH}")
+    sys.exit(0)
 
-src = src.replace(old_block, new_block, 1)
+src = new_src
 
 with open(PATH, "w", encoding="utf-8") as f:
     f.write(src)
 
-print("patched: retry capped at 5, log added, table cached")
+print(f"patched: retry capped at 5 in {PATH}")
