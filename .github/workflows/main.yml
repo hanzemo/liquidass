@@ -51,19 +51,18 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/opa334/AltList.git /tmp/AltList
           cd /tmp/AltList
-          make clean || true
-          make FINALPACKAGE=1 THEOS="$THEOS" TARGET="$DEVICE_TARGET" || true
-          for dir in lib lib/iphone/rootless/lib lib/iphone/rootful/lib; do
-            mkdir -p "$THEOS/$dir"
-            cp -Rv /tmp/AltList/.theos/obj/AltList.framework "$THEOS/$dir/" 2>/dev/null || true
-          done
+          make clean
+          make FINALPACKAGE=1 THEOS="$THEOS" TARGET="$DEVICE_TARGET"
+          bash install_to_theos.sh
+          echo "--- verifying AltList install ---"
+          find "$THEOS" -name "AltList.framework" -type d
 
       - name: patch registerCustomFilter
         run: python3 .github/patch_retry.py
 
       - name: show patched block
         run: |
-          grep -n -A 30 "filter_table null" LiquidAssBackboardd/Tweak.mm || true
+          grep -n -A 30 "filter_table null" LiquidAssBackboardd/Tweak.mm
 
       - name: build roothide
         run: |
