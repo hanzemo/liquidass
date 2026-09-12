@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Patch LiquidAssBackboardd/Tweak.mm:
-  1. 在 registerCustomFilter 开头插入缓存声明
-  2. 把 filter_table null 的无限重试改成上限 5 次
-  3. 在重试日志里打印 slot 和 *slot 的真实值
-任何一步匹配失败都直接退出，避免构建出错误的产物。
-"""
 import re
 import sys
 
@@ -20,7 +13,7 @@ if anchor_fn not in src:
     sys.exit("ERROR: registerCustomFilter anchor not found")
 
 if "g_cachedFilterTableSlot" in src:
-    sys.exit("ERROR: file already patched (g_cachedFilterTableSlot present)")
+    sys.exit("ERROR: file already patched")
 
 cache_decl = (
     "static bool registerCustomFilter(void) {\n"
@@ -29,16 +22,16 @@ cache_decl = (
 )
 src = src.replace(anchor_fn, cache_decl, 1)
 
-# ---------- 2. 替换无限重试块 ----------
-pattern = re.compile(
-    r'if \(!\*filterTableSlot\) \{\s*'
-    r'lglog\("registerCustomFilter: filter_table null, retrying in 250ms"\);\s*'
-    r'dispatch_after\([^;]+;\s*'
-    r'return false;\s*\}',
-    re.DOTALL,
-)
+# ---------- 2. 用精确字符串替换 ----------
+old_block = '''    if (!*filterTableSlot) {
+        lglog("registerCustomFilter: filter_table null, retrying in 250ms");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                       ^{ registerCustomFilter(); });
+        return false;
+    }'''
 
-replacement = '''if (!*filterTableSlot) {
+new_block = '''    if (!*filterTableSlot) {
         static int sRetry = 0;
         static const int kMaxRetries = 5;
         if (sRetry < kMaxRetries) {
@@ -55,7 +48,6 @@ replacement = '''if (!*filterTableSlot) {
         return false;
     }
 
-    // --- cache the resolved table once it becomes non-null ---
     if (!g_cachedFilterTable) {
         g_cachedFilterTable = *filterTableSlot;
         if (g_cachedFilterTable) {
@@ -64,9 +56,10 @@ replacement = '''if (!*filterTableSlot) {
         }
     }'''
 
-src, n = pattern.subn(replacement, src, count=1)
-if n == 0:
-    sys.exit("ERROR: retry block regex did not match")
+if old_block not in src:
+    sys.exit("ERROR: retry block not found (exact match failed)")
+
+src = src.replace(old_block, new_block, 1)
 
 with open(PATH, "w", encoding="utf-8") as f:
     f.write(src)
