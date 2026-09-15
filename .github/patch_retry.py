@@ -43,27 +43,68 @@ def replace_or_die(text, old, new, label, count=1):
 
 
 # ============================================================
-# 1. 函数入口插入缓存声明（不再包含 g_lgCachedDescriptor）
+# 1. 文件级全局缓存 + 前置声明 + 失效函数
+#    全部修好：sRetry 全局化、主动重解析、保留 code 地址
 # ============================================================
 anchor_fn = "static bool registerCustomFilter(void) {\n"
 if anchor_fn not in src:
     print(f"ERROR: registerCustomFilter anchor not found in {PATH}")
     sys.exit(1)
 
-cache_decl = (
+globals_and_invalidator = (
+    "// ===== 崩溃修复：缓存提升为文件级全局 =====\n"
+    "static bool    g_lgSymbolsResolved  = false;\n"
+    "static void  **g_lgCachedVtable     = nullptr;\n"
+    "static int     g_lgCachedEdgeSlot   = -1;\n"
+    "static int     g_lgCachedRenderSlot = -1;\n"
+    "static void  **g_lgCachedCtxSlot    = nullptr;\n"
+    "static int     g_lgRetryCount       = 0;   // 从 registerCustomFilter 内部提升\n"
+    "\n"
+    "// 前置声明：让 LGInvalidateSymbolCache 能重新触发解析\n"
+    "static bool registerCustomFilter(void);\n"
+    "\n"
+    "static void LGInvalidateSymbolCache(const char *reason) {\n"
+    "    if (!g_lgSymbolsResolved && !g_lgCachedVtable) return;\n"
+    "    lglog(\"LGInvalidateSymbolCache: %s (was vtable=%p edge=%d render=%d retry=%d)\",\n"
+    "          reason, g_lgCachedVtable, g_lgCachedEdgeSlot, g_lgCachedRenderSlot,\n"
+    "          g_lgRetryCount);\n"
+    "    g_lgSymbolsResolved  = false;\n"
+    "    g_lgCachedVtable     = nullptr;\n"
+    "    g_lgCachedEdgeSlot   = -1;\n"
+    "    g_lgCachedRenderSlot = -1;\n"
+    "    g_lgCachedCtxSlot    = nullptr;\n"
+    "    g_lgRetryCount       = 0;   // 重置重试计数，允许重解析\n"
+    "    // 注意：不动 g_origGaussR13 / g_origGaussEdgeInfo / g_gaussianHooksInstalled\n"
+    "    // 它们指向 QuartzCore 代码段，vtable 重建不影响代码段\n"
+    "    // 主动触发重新解析（否则只清不重建，功能等于禁用）\n"
+    "    dispatch_async(dispatch_get_main_queue(), ^{\n"
+    "        registerCustomFilter();\n"
+    "    });\n"
+    "}\n"
+    "\n"
+)
+
+src = src.replace(anchor_fn, globals_and_invalidator + anchor_fn, 1)
+
+
+# ============================================================
+# 2. registerCustomFilter 内部不再声明 static 缓存
+# ============================================================
+src = replace_or_die(
+    src,
     "static bool registerCustomFilter(void) {\n"
     "    static bool    g_lgSymbolsResolved  = false;\n"
     "    static void  **g_lgCachedVtable     = nullptr;\n"
     "    static int     g_lgCachedEdgeSlot   = -1;\n"
     "    static int     g_lgCachedRenderSlot = -1;\n"
-    "    static void  **g_lgCachedCtxSlot    = nullptr;\n"
+    "    static void  **g_lgCachedCtxSlot    = nullptr;\n",
+    "static bool registerCustomFilter(void) {\n",
+    "remove static cache decls",
 )
-src = src.replace(anchor_fn, cache_decl, 1)
 
 
 # ============================================================
-# 2. 解析段包进 if，并缓存；块内保留同名局部变量，
-#    块外不再声明桥接变量
+# 3. 解析段包进 if，缓存到全局
 # ============================================================
 old_parse = """    void **gaussCtxSlot = (void **)LGResolve_GaussianCtxSlot();
     if (!gaussCtxSlot) {
@@ -181,7 +222,7 @@ new_parse = """    if (!g_lgSymbolsResolved) {
             lglog("registerCustomFilter: Gaussian hooks installed before filter registration");
         }
 
-        // ---- 缓存解析结果 ----
+        // ---- 缓存解析结果到文件级全局 ----
         g_lgCachedVtable     = gaussVtable;
         g_lgCachedEdgeSlot   = edgeInfoSlot;
         g_lgCachedRenderSlot = renderSlot;
@@ -196,7 +237,7 @@ src = replace_or_die(src, old_parse, new_parse, "parse block")
 
 
 # ============================================================
-# 3. 重试块：200 次 + 主队列
+# 4. 重试块：全局 sRetry + 200 次 + 主队列
 # ============================================================
 old_retry = """    if (!*filterTableSlot) {
         lglog("registerCustomFilter: filter_table null, retrying in 250ms");
@@ -208,12 +249,11 @@ old_retry = """    if (!*filterTableSlot) {
 """
 
 new_retry = """    if (!*filterTableSlot) {
-        static int sRetry = 0;
         static const int kMaxRetries = 200;
-        if (sRetry < kMaxRetries) {
-            sRetry++;
+        if (g_lgRetryCount < kMaxRetries) {
+            g_lgRetryCount++;
             lglog("registerCustomFilter: retry %d/%d *slot=%p (cached: edge=%d render=%d)",
-                  sRetry, kMaxRetries, *filterTableSlot,
+                  g_lgRetryCount, kMaxRetries, *filterTableSlot,
                   g_lgCachedEdgeSlot, g_lgCachedRenderSlot);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
                            dispatch_get_main_queue(),
@@ -230,8 +270,7 @@ src = replace_or_die(src, old_retry, new_retry, "retry block")
 
 
 # ============================================================
-# 4. 所有块外引用 → 缓存变量（全部走 replace_or_die）
-#    如果哪条没匹配上，脚本会打印期望原文并退出
+# 5. 所有块外引用 → 缓存变量
 # ============================================================
 
 src = replace_or_die(
@@ -285,11 +324,60 @@ src = replace_or_die(
 
 
 # ============================================================
-# 5. 写盘
+# 6. 崩溃修复：ourCustomRender13 入口加防御检查
+#    这是最关键的——校验缓存有效 + vtable 还在 QuartzCore 镜像内
+# ============================================================
+defensive_anchor = "static void ourCustomRender13("
+if defensive_anchor not in src:
+    print("ERROR: ourCustomRender13 signature not found.")
+    print("       请把函数签名贴出来，我改成精确匹配。")
+    sys.exit(1)
+
+# 找函数签名的 `{`
+idx = src.index(defensive_anchor)
+brace_idx = src.index("{", idx)
+insert_pos = brace_idx + 1
+
+defensive_code = (
+    "\n"
+    "    // ===== 崩溃修复：每次校验缓存，防止 CA 重建 vtable 后悬空 =====\n"
+    "    if (!g_lgSymbolsResolved || !g_lgCachedVtable) {\n"
+    "        lglog(\"ourCustomRender13: cache invalid, skipping custom render\");\n"
+    "        return;\n"
+    "    }\n"
+    "    if (!LGSymAddressInQuartzCoreImage((void *)g_lgCachedVtable)) {\n"
+    "        lglog(\"ourCustomRender13: vtable %p left QuartzCore, invalidating\",\n"
+    "              g_lgCachedVtable);\n"
+    "        LGInvalidateSymbolCache(\"vtable-left-image\");\n"
+    "        return;\n"
+    "    }\n"
+    "    uintptr_t _vt = (uintptr_t)g_lgCachedVtable;\n"
+    "    if (_vt < 0x100000000ULL || _vt > 0x900000000ULL) {\n"
+    "        lglog(\"ourCustomRender13: vtable out of range %p, invalidating\", g_lgCachedVtable);\n"
+    "        LGInvalidateSymbolCache(\"out-of-range\");\n"
+    "        return;\n"
+    "    }\n"
+    "    // vtable slot 也要校验：如果 slot 指向了非法地址，说明 vtable 内容变了\n"
+    "    void *_slot0 = g_lgCachedVtable[0];\n"
+    "    if (!_slot0 || !LGSymAddressInQuartzCoreImage(_slot0)) {\n"
+    "        lglog(\"ourCustomRender13: vtable[0]=%p invalid, invalidating\", _slot0);\n"
+    "        LGInvalidateSymbolCache(\"vtable-slot0-invalid\");\n"
+    "        return;\n"
+    "    }\n"
+)
+
+src = src[:insert_pos] + defensive_code + src[insert_pos:]
+print("INFO: inserted defensive check into ourCustomRender13")
+
+
+# ============================================================
+# 7. 写盘
 # ============================================================
 with open(PATH, "w", encoding="utf-8") as f:
     f.write(src)
 
-print(f"patched OK: symbols cached + retry 200 on main queue in {PATH}")
-print("verify:  grep -n 'gaussVtable\\|gaussCtxSlot\\|edgeInfoSlot\\|renderSlot' " + PATH)
-print("         (outside the if-block there must be NO bare names)")
+print(f"patched OK: {PATH}")
+print("checks:")
+print("  grep -n 'LGInvalidateSymbolCache' " + PATH)
+print("  grep -n 'g_lgRetryCount' " + PATH)
+print("  grep -n 'LGSymAddressInQuartzCoreImage' " + PATH)
